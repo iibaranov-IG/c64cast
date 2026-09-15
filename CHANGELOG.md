@@ -115,6 +115,16 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
 
 ### Fixed
 
+- **A scene could open on the tail of the previous scene's audio.**
+  `AudioStreamer.stop()` drained its queue without bumping the splice epoch, so
+  a producer that had captured its epoch before that drain — a file decoder
+  still mid-encode, or one just released from the backpressure spin — landed a
+  blob behind it. The next scene inherited it, and since the bring-up resets the
+  pushed count but not the queued one, `position_seconds()` read 0 until it
+  drained. `stop()` now bumps the epoch as soon as it clears `running`, the way
+  `flush()` bumps ahead of its own drain, and `push_samples` is a no-op once
+  stopped.
+
 - **An audio-file scene's teardown paused for its whole join timeout, then
   dropped the decoder it had failed to join.** A decode thread parked in
   `push_samples` on a full sampler queue is released by the audio stop, which
