@@ -115,7 +115,14 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
 
 ### Fixed
 
-- **Audio-file scenes cannot restart while an old decoder is still alive.** Teardown now stops the sink before joining the decoder, keeps a timed-out thread referenced, and refuses to clear its stop signal or create a second producer until the survivor exits.
+- **An audio-file scene's teardown paused for its whole join timeout, then
+  dropped the decoder it had failed to join.** A decode thread parked in
+  `push_samples` on a full sampler queue is released by the audio stop, which
+  ran *behind* the join — so the join spent its full 2 s and returned with the
+  thread still running, and the reference was cleared anyway. Teardown now stops
+  the sink ahead of the join, and a decoder that still survives it stays
+  referenced: the next `setup()` on that source refuses to clear its stop signal
+  or start a second decoder until the survivor exits.
 
 - **A CIA-timed SID tune could peg a core for the whole scene, and the guard
   against it was skipped on exactly those tunes.** The oscilloscope and the

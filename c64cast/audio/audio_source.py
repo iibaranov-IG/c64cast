@@ -313,10 +313,11 @@ class AudioFileSource:
         """Re-pick from the (re-resolved) pool, install the analyzer, and spin up
         the decode→audio thread. Never raises on a decode/analyzer hiccup —
         degrades to non-reactive so the visual keeps running. Plenty else does
-        escape, though — a file spec that resolves to nothing openable, a host
-        too short of threads to start the decode thread, and whatever the audio
-        bring-up raises over the link. `SourceScene.setup` catches all of it,
-        logs, and flips `is_done` so the playlist advances.
+        escape, though, including a file spec that resolves to nothing openable,
+        a decode thread from the last activation still running, a host too short
+        of threads to start a new one, and whatever the audio bring-up raises
+        over the link. `SourceScene.setup` catches all of it, logs, and flips
+        `is_done` so the playlist advances.
 
         Ordering differs by backend, by what each bring-up call *waits* for
         rather than by whether it touches the link — both do. The 4-bit DAC's
@@ -329,11 +330,11 @@ class AudioFileSource:
         prebuffer fills promptly and playback starts without the empty-prebuffer
         stall.
 
-        If a previous decode thread outlives teardown, setup refuses to clear
-        its stop event or start another one. Teardown stops the audio sink before
-        joining, which releases a sampler producer blocked on a full queue; a
-        thread that still survives the bounded join remains referenced so the
-        next setup cannot silently run two decoders into one sink."""
+        If a previous decode thread outlives teardown, setup raises rather than
+        clearing its stop event or starting another one. Teardown stops the
+        audio sink before joining, which releases a sampler producer blocked on
+        a full queue; a thread that still survives the bounded join remains
+        referenced, so this source cannot stack a second decoder behind it."""
         if self._thread is not None:
             if self._thread.is_alive():
                 log.error("audio file: previous decode thread is still running; refusing restart")

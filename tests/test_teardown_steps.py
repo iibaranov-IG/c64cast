@@ -230,8 +230,10 @@ class AudioSourceTeardownTests(unittest.TestCase):
     """The two live `audio_source.py` teardowns that sequenced independent
     guarantees.
 
-    Both end in the audio stop, which is what keeps the next scene from
-    inheriting a streaming pump — and both put a thread join in front of it.
+    Both owe the next scene an audio stop, which is what keeps it from
+    inheriting a streaming pump. `MicAudioSource` joins its analyzer in front of
+    that stop; `AudioFileSource` joins its decoder behind it, because stopping
+    the sink is what releases a decoder parked on a full queue.
     """
 
     def test_a_failing_feature_stop_does_not_starve_the_mic_audio_stop(self):
@@ -270,8 +272,9 @@ class AudioSourceTeardownTests(unittest.TestCase):
         so publishing the thread before starting it put an unjoinable object
         where `teardown` reaches for one. Both backend orderings are pinned
         because they differ in what is already running when the start fails: on
-        the DAC path `start_for_external_source()` has run, so a raise escaping
-        teardown's first step would strand a live pump.
+        the DAC path `start_for_external_source()` has run, so the pump is live
+        by the time the raise escapes `setup`, and teardown's `audio stop` is
+        the only thing that shuts it down.
         """
         for is_sampler in (False, True):
             with self.subTest(sampler=is_sampler):
