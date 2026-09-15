@@ -185,6 +185,30 @@ class SceneTeardownTests(unittest.TestCase):
         self.assertTrue(audio.stop.called, "the next scene inherits a streaming audio pump")
         self.assertIsNone(scene._last_osd_shown, "lap 2 suppresses its first OSD repaint")
 
+    def test_the_audio_stops_before_the_video_source_is_joined(self):
+        """`AVFileSource.close()` bounded-joins the thread that feeds the sink.
+
+        That demux thread pushes into `push_samples`, and on the sampler it
+        parks there until the *sampler* stops — `_closed` releases a demuxer
+        waiting on the frame queue, but not one waiting on the audio queue. So
+        the audio stop has to run in front of the close, or the close burns its
+        full 1 s bound and logs a join timeout, which is #369's symptom at the
+        busier site.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "clip.mp4")
+            with open(clip, "wb") as f:
+                f.write(b"\x00" * 16)
+            order: list[str] = []
+            audio = MagicMock()
+            audio.stop.side_effect = lambda: order.append("audio stop")
+            scene = VideoScene(MagicMock(), audio, MagicMock(), clip)
+            source = MagicMock()
+            source.close.side_effect = lambda: order.append("source close")
+            scene.source = source
+            scene.teardown()
+        self.assertEqual(order, ["audio stop", "source close"])
+
     def test_the_av_lag_summary_reads_the_clock_before_the_audio_stops(self):
         """The summary's `clock/wall` gauge divides by a clock the audio stop
         zeroes.
