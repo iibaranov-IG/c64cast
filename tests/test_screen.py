@@ -100,6 +100,8 @@ class LifetimeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.api = _FakeApi()
         self.feed = ScreenFeed(lambda: {"c64cast": self.api})
+        # A feed that served a watcher is left holding a live sweeper thread.
+        self.addCleanup(self.feed.close)
 
     def test_the_stream_comes_up_for_a_watcher_and_stays_up_for_a_second(self):
         with self.feed.watching("c64cast"):
@@ -164,11 +166,11 @@ class LifetimeTest(unittest.TestCase):
         self.assertIsNone(self.feed._sweeper)
 
     def test_a_receiver_does_not_outlive_the_show_it_belongs_to(self):
-        # A watcher still holding the stream open would otherwise keep a
-        # receiver alive against a backend that is gone, re-arming a watchdog
-        # over a link that no longer exists.
+        # A watcher still holding the stream open would keep a receiver alive
+        # against a backend that is gone, re-arming a watchdog over a dead link.
         running: dict[str, _FakeApi] = {"c64cast": self.api}
         feed = ScreenFeed(lambda: dict(running))
+        self.addCleanup(feed.close)
         with feed.watching("c64cast"):
             self.assertEqual(self.api.starts, 1)
             running.clear()
@@ -186,9 +188,9 @@ class LifetimeTest(unittest.TestCase):
 
 class StopQuietlyTest(unittest.TestCase):
     def test_a_failure_to_stop_is_logged_and_not_raised(self):
-        # Called from a sweep and from teardown, where there is nothing left to
-        # tell: raising would take the sweeper thread down with it and leak
-        # every other receiver.
+        # Called from a sweep and from teardown, where there is nothing left
+        # to tell: raising would take the sweeper thread down and leak every
+        # other receiver.
         class _Stuck:
             def stop(self) -> None:
                 raise OSError("the link went away")
@@ -232,8 +234,7 @@ class EncodeTest(unittest.TestCase):
         self.assertEqual(list(decoded[0, 0]), [int(c) for c in C64_PALETTE_BGR[2]])
 
     def test_png_rather_than_jpeg_is_the_smaller_one_on_this_content(self):
-        # The reason for the choice, asserted rather than left in a comment:
-        # flat 16-color art with hard edges is PNG's best case and a DCT's
+        # Flat 16-color art with hard edges is PNG's best case and a DCT's
         # worst, so the usual "JPEG for video" advice inverts here.
         import cv2
 

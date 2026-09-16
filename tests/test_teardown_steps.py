@@ -110,9 +110,9 @@ class RunTeardownStepsTests(unittest.TestCase):
         self.assertIn("RuntimeError", caught.output[0])  # exc_info is attached
 
     def test_an_interrupt_is_not_swallowed(self):
-        # Teardown runs on the shutdown path. Catching Exception (not
-        # BaseException) is what keeps a KeyboardInterrupt from being logged as
-        # a failed step and then discarded, which would hang the shutdown.
+        # Teardown runs on the shutdown path, so catching Exception rather than
+        # BaseException is what keeps a KeyboardInterrupt from being logged as
+        # a failed step and discarded, hanging the shutdown.
         def interrupt() -> None:
             raise KeyboardInterrupt
 
@@ -147,9 +147,9 @@ class SceneTeardownTests(unittest.TestCase):
         self.assertTrue(source.teardown.called, "the capture handle leaks for the rest of the run")
 
     def test_a_failing_poll_stop_does_not_starve_the_launcher_reset(self):
-        # The reset is mandatory for a `.crt` — `run_crt` leaves it active — and
-        # `PollThread.stop` joins, which `_pollthread` documents as able to raise
-        # RuntimeError on a target that stopped its own poller.
+        # The reset is mandatory for a `.crt` (`run_crt` leaves it active), and
+        # `PollThread.stop` joins, which `_pollthread` documents as able to
+        # raise RuntimeError on a target that stopped its own poller.
         with tempfile.TemporaryDirectory() as tmp:
             prg = os.path.join(tmp, "demo.prg")
             with open(prg, "wb") as f:
@@ -164,9 +164,9 @@ class SceneTeardownTests(unittest.TestCase):
         self.assertTrue(api.reset.called, "a launched .crt stays active into the next scene")
 
     def test_a_failing_border_restore_does_not_starve_the_video_guarantees(self):
-        # The most-used scene type, and the first thing after the self-guarding
-        # base teardown is a $D020 write over the link -- so it fails like any
-        # other DMA op, and used to take the three guarantees behind it down.
+        # The most-used scene type: the first thing after the self-guarding
+        # base teardown is a $D020 write over the link, so it fails like any
+        # other DMA op and took the three guarantees behind it down.
         with tempfile.TemporaryDirectory() as tmp:
             clip = os.path.join(tmp, "clip.mp4")
             with open(clip, "wb") as f:
@@ -184,6 +184,30 @@ class SceneTeardownTests(unittest.TestCase):
         self.assertTrue(source.close.called, "the PyAV handle leaks for the rest of the run")
         self.assertTrue(audio.stop.called, "the next scene inherits a streaming audio pump")
         self.assertIsNone(scene._last_osd_shown, "lap 2 suppresses its first OSD repaint")
+
+    def test_the_audio_stops_before_the_video_source_is_joined(self):
+        """`AVFileSource.close()` bounded-joins the thread that feeds the sink.
+
+        That demux thread pushes into `push_samples`, and on the sampler it
+        parks there until the *sampler* stops — `_closed` releases a demuxer
+        waiting on the frame queue, but not one waiting on the audio queue. So
+        the audio stop has to run in front of the close, or the close burns its
+        full 1 s bound and logs a join timeout, which is #369's symptom at the
+        busier site.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "clip.mp4")
+            with open(clip, "wb") as f:
+                f.write(b"\x00" * 16)
+            order: list[str] = []
+            audio = MagicMock()
+            audio.stop.side_effect = lambda: order.append("audio stop")
+            scene = VideoScene(MagicMock(), audio, MagicMock(), clip)
+            source = MagicMock()
+            source.close.side_effect = lambda: order.append("source close")
+            scene.source = source
+            scene.teardown()
+        self.assertEqual(order, ["audio stop", "source close"])
 
     def test_the_av_lag_summary_reads_the_clock_before_the_audio_stops(self):
         """The summary's `clock/wall` gauge divides by a clock the audio stop
@@ -216,9 +240,8 @@ class SceneTeardownTests(unittest.TestCase):
             with self.assertLogs(_SCENES_LOG, level="INFO") as caught:
                 scene.teardown()
         # Match the emitted prefix, not the step label: the runner's own
-        # failure line is `teardown step 'A/V lag summary' failed`, so a filter
-        # on the label alone stays green when the summary raises and the gauge
-        # is gone entirely.
+        # failure line is `teardown step 'A/V lag summary' failed`, so a label
+        # filter stays green when the summary raises and the gauge is gone.
         summaries = [line for line in caught.output if "video A/V lag summary:" in line]
         self.assertEqual(len(summaries), 1, caught.output)
         gauge = re.search(r"clock/wall=([0-9.]+)", summaries[0])
@@ -231,18 +254,17 @@ class AudioSourceTeardownTests(unittest.TestCase):
     """The two live `audio_source.py` teardowns that sequenced independent
     guarantees.
 
-    Both end in the audio stop, which is what keeps the next scene from
-    inheriting a streaming pump — and both put a thread join in front of it.
+    Both owe the next scene an audio stop, which is what keeps it from
+    inheriting a streaming pump. `MicAudioSource` joins its analyzer in front of
+    that stop; `AudioFileSource` joins its decoder behind it, because stopping
+    the sink is what releases a decoder parked on a full queue.
     """
 
     def test_a_failing_feature_stop_does_not_starve_the_mic_audio_stop(self):
         # The raise is injected, not reproduced: `AudioFeatureStream.stop` is a
         # `PollThread.stop`, which raises only the join-current-thread
-        # `RuntimeError` that `_pollthread` makes its lifecycle lock reentrant
-        # to produce — and nothing tears a mic source down from inside the
-        # analyzer's own tick. So this pins the runner's property at this site
-        # rather than a live defect; the file and SID sources next to it are
-        # reproductions.
+        # `RuntimeError`, and nothing tears a mic source down from inside the
+        # analyzer's own tick.
         audio = MagicMock()
         source = MicAudioSource(audio, MagicMock())
         source._features = _wedged_features()
@@ -274,8 +296,9 @@ class AudioSourceTeardownTests(unittest.TestCase):
         so publishing the thread before starting it put an unjoinable object
         where `teardown` reaches for one. Both backend orderings are pinned
         because they differ in what is already running when the start fails: on
-        the DAC path `start_for_external_source()` has run, so a raise escaping
-        teardown's first step would strand a live pump.
+        the DAC path `start_for_external_source()` has run, so the pump is live
+        by the time the raise escapes `setup`, and teardown's `audio stop` is
+        the only thing that shuts it down.
         """
         for is_sampler in (False, True):
             with self.subTest(sampler=is_sampler):
@@ -314,3 +337,39 @@ class AudioSourceTeardownTests(unittest.TestCase):
         audio.stop.reset_mock()
         scene.teardown()
         self.assertTrue(audio.stop.called, "the next scene inherits a streaming audio pump")
+
+    @unittest.skipUnless(ensure_pyav(), "PyAV (video extra) not installed")
+    def test_file_audio_stops_the_sink_before_joining_decode(self):
+        order: list[str] = []
+        audio = MagicMock(is_sampler=False)
+        audio.stop.side_effect = lambda: order.append("audio stop")
+        source = self._file_source(audio, reactive=False)
+        thread = MagicMock()
+        thread.join.side_effect = lambda _timeout: order.append("decode join")
+        thread.is_alive.return_value = False
+        source._thread = thread
+
+        source.teardown()
+
+        self.assertEqual(order, ["audio stop", "decode join"])
+        self.assertIsNone(source._thread)
+
+    @unittest.skipUnless(ensure_pyav(), "PyAV (video extra) not installed")
+    def test_a_surviving_decode_thread_blocks_restart(self):
+        audio = MagicMock(is_sampler=False)
+        source = self._file_source(audio, reactive=False)
+        source._stop.clear()
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        source._thread = thread
+
+        with self.assertLogs(_SOURCES_LOG, level="ERROR"):
+            source.teardown()
+        self.assertIs(source._thread, thread)
+        self.assertTrue(source._stop.is_set())
+
+        with self.assertLogs(_SOURCES_LOG, level="ERROR"):
+            with self.assertRaisesRegex(RuntimeError, "previous audio-file decode thread"):
+                source.setup()
+        self.assertTrue(source._stop.is_set(), "restart released the surviving decode thread")
+        self.assertFalse(audio.start_for_external_source.called)

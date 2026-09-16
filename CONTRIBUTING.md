@@ -18,7 +18,7 @@ git clone https://github.com/kfox/c64cast
 cd c64cast
 uv sync --all-extras    # creates/updates .venv from uv.lock: every runtime
                         # extra + the dev tool group
-pre-commit install      # ruff + pyright + tests run before every commit
+uv run --locked pre-commit install   # ruff + pyright + tests run before every commit
 ```
 
 Then either prefix one-off commands with `uv run`, or let
@@ -77,7 +77,7 @@ whether or not the current shell has `.venv` activated:
 | Target | What it does |
 |---|---|
 | `make sync` | `uv sync --all-extras` (refresh the project env) |
-| `make lint` | `ruff check` |
+| `make lint` | `ruff check` + `ruff format --check` |
 | `make fmt` | `ruff format` |
 | `make test` | the unittest suite, parallel across cores (`T=tests.test_foo` runs just that, serially) |
 | `make coverage` | tests under coverage → report + HTML + `coverage.xml` + JUnit XML |
@@ -90,8 +90,10 @@ whether or not the current shell has `.venv` activated:
 | `make mutation-ready` | arm the tree's bytecode for a mutation proof (see [Proving a test can fail](#proving-a-test-can-fail)) |
 | `make mutation-check` | verify it is still armed — a clean, a new worktree or a `uv sync` un-arms it silently |
 
-CI runs the same lint, typecheck, and tests on every push and pull request
-across Python 3.11–3.14 — see
+CI runs the same tests on every push and pull request across Python 3.11–3.14
+and three operating systems, the same lint and formatting once in the
+`pre-commit` job, and the same type checks once per target platform on Python
+3.14 in the `types` job — see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Type-checking is
 deliberately two-tiered: `pyright` in basic mode across the whole tree
 (including tests), matching Pylance's VS Code defaults so editor diagnostics
@@ -128,10 +130,23 @@ anything under `assets/` that git does not carry. The rule, the reasoning and
 the two known blind spots are in
 [`tests/_fs_sandbox.py`](tests/_fs_sandbox.py)'s docstring.
 
-If a test trips it, the fix is almost always to point the code under test at a
-file the test writes under `tempfile.mkdtemp()`, or to run the block from
-`tmp_cwd()` (in [`tests/_fakes.py`](tests/_fakes.py)) when what it resolves is a
-*relative* default like `assets/videos/`. `MachineSettingsIsolation` is still
+**A test may not leave a thread running either, and the same startup hook
+enforces that.** A thread outlives every guard the test was wrapped in —
+`quiet_logging()` is `logging.disable`, which ends with its block, and
+`assertLogs` swaps a handler for the same span — so a poll thread still
+ticking afterwards logs into the middle of an unrelated test.
+`tests/sitecustomize.py` also arms
+[`tests/_thread_sandbox.py`](tests/_thread_sandbox.py), which fails the test
+that ends with a thread it started still alive, naming the thread. `PollThread`
+names every loop at its construction site, so the name identifies the owner;
+the fix is to call that object's teardown from `addCleanup`. A stray gets half
+a second to finish first, so a thread genuinely winding down is not a failure.
+
+If a test trips the filesystem hook, the fix is almost always to point the code
+under test at a file the test writes under `tempfile.mkdtemp()`, or to run the
+block from `tmp_cwd()` (in [`tests/_fakes.py`](tests/_fakes.py)) when what it
+resolves is a *relative* default like `assets/videos/`.
+`MachineSettingsIsolation` is still
 there for a module that wants a settings/data directory of its own, fresh and
 untouched by anything else.
 

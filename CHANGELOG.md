@@ -21,6 +21,26 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
 
 ### Added
 
+- **`host_palette = "auto"` now asks an Ultimate which 16 colors it is actually
+  driving**, instead of assuming the built-in table. Every color decision in
+  the pipeline is a distance measured against that table, so a machine running
+  a custom `.vpl` palette was being quantized against the wrong 16 — a wrong
+  table does not tint the picture, it changes which color each pixel becomes.
+  The read goes over the Ultimate Command Interface, costs one round of
+  register polling at startup, and uploads no 6502 code. It needs firmware
+  **3.15** or newer, which added runtime palette control to the Command
+  Interface. Anything that cannot answer — older firmware, a failed read —
+  falls back to the built-in table exactly as before, including the existing
+  warning that names the loaded `.vpl`.
+
+- **A search box on the documentation site.** Every page at
+  <https://kfox.github.io/c64cast/> now carries a search field in the header
+  that matches against every book chapter and standalone doc, ranking a title
+  hit over a body hit, and jumps straight to the page on Enter or a click.
+  It is client-side against a JSON index `scripts/build_site.py` writes at
+  build time — no server, no third-party search service, no page reload.
+  Press `/` anywhere on the site to focus it.
+
 - **A warning when a tune's INIT does not finish running on the host
   emulator.** The scope and the reactive visuals are both drawn from a
   host-side 6502 running the same tune the SID chip plays, and a tune whose
@@ -94,6 +114,32 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
   visibly less.
 
 ### Fixed
+
+- **A video scene with sampler audio spent a second in teardown.** Closing the
+  video source bounded-joins the demux thread that feeds the sink, and on the
+  sampler that thread parks in `push_samples` until the sampler stops — which
+  is what the audio stop does, and it ran behind the close. The close burned
+  its full 1 s bound and logged a join timeout; the audio now stops in front
+  of it.
+
+- **A scene could open on the tail of the previous scene's audio.**
+  `AudioStreamer.stop()` drained its queue without bumping the splice epoch, so
+  a producer that had captured its epoch before that drain — a file decoder
+  still mid-encode, or one just released from the backpressure spin — landed a
+  blob behind it. The next scene inherited it, and since the bring-up resets the
+  pushed count but not the queued one, `position_seconds()` read 0 until it
+  drained. `stop()` now bumps the epoch as soon as it clears `running`, the way
+  `flush()` bumps ahead of its own drain, and `push_samples` is a no-op once
+  stopped.
+
+- **An audio-file scene's teardown paused for its whole join timeout, then
+  dropped the decoder it had failed to join.** A decode thread parked in
+  `push_samples` on a full sampler queue is released by the audio stop, which
+  ran *behind* the join — so the join spent its full 2 s and returned with the
+  thread still running, and the reference was cleared anyway. Teardown now stops
+  the sink ahead of the join, and a decoder that still survives it stays
+  referenced: the next `setup()` on that source refuses to clear its stop signal
+  or start a second decoder until the survivor exits.
 
 - **A CIA-timed SID tune could peg a core for the whole scene, and the guard
   against it was skipped on exactly those tunes.** The oscilloscope and the

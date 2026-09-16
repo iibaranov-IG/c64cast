@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from unittest import mock
 
 from c64cast._wire_log import LogThrottle
+from c64cast.hw import vdc
 from c64cast.hw.backend import HardwareProfile
 from c64cast.hw.c64 import actual_rate_for_latch, kernal_cia1_latch
 
@@ -127,7 +128,6 @@ class FakeSocketDMA:
     REUWRITE calls so tests can verify REU pump preload behavior."""
 
     def __init__(self):
-        # List of (reu_offset, bytes) tuples in call order.
         self.reuwrites: list[tuple[int, bytes]] = []
 
     def reuwrite(self, reu_offset: int, data: bytes) -> None:
@@ -141,35 +141,23 @@ class FakeAPI:
         self.mem_files: dict[str, bytes] = {}
         self.memories: dict[str, str] = {}
         self.writes: list[tuple[str, bytes]] = []
-        # Unified sequential op log. Each entry = (op_name, *args). Used
-        # by tests that need to assert relative ORDER across different
-        # write surfaces (e.g. "stub upload happened BEFORE IRQ vector
-        # hook"). `writes` / `mem_files` / `memories` / `regs` are still
-        # the right things to use for last-write-wins lookups.
+        # Sequential (op_name, *args) log for cross-surface ORDER assertions;
+        # the per-surface attributes below are last-write-wins.
         self.ops: list[tuple] = []
         self.cache_invalidations = 0
         self.region_invalidations: list[int] = []
         self.sid_played: tuple[bytes, int] | None = None
-        # Tracks each cue_song_reinit(song) call in order. Tests inspect
-        # this to verify the SHIFT cycle path uses the fast in-place
-        # re-INIT instead of going back through run_sid_player.
         self.cue_song_reinits: list[int] = []
         self.cue_song_reinit_play_banks: list[int | None] = []
         self.canned_regs: bytes = bytes(25)
         self.socket_dma = FakeSocketDMA()
-        # Device config API (Ultimate REST) surface for multi-SID tests. Tests
-        # opt in via `api.profile = HardwareProfile(..., supports_config=True)`
-        # and seed `config_store` to model detected sockets / current values.
+        # Ultimate REST config surface: tests opt in with a
+        # `supports_config=True` profile and seed `config_store`.
         self.config_puts: list[tuple[str, str, str]] = []
         self.config_store: dict[str, dict[str, str]] = {}
-        # GET /v1/info surface for dac_calibration key resolution tests. None
-        # (default) mirrors a backend/firmware with no /v1/info (raises).
         self.device_info: dict[str, str] | None = None
-        # Hardware capability profile — mirrors the real backends' `profile`.
-        # Defaults (supports_reu=True) make build_scene resolve the no-REU
-        # double_buffer "auto" path OFF, so existing tests see no change; tests
-        # that want the TR's no-REU behavior set `api.profile = HardwareProfile(
-        # supports_reu=False)` or override the field.
+        # Mirrors the real backends' `profile`; `supports_reu=False` models
+        # the TeensyROM.
         self.profile = HardwareProfile(name="Fake", family="fake")
 
     @classmethod
@@ -228,8 +216,6 @@ class FakeAPI:
         return len(b)
 
     def reu_write(self, reu_offset, data):
-        # Mirror Ultimate64API.reu_write, which forwards to socket_dma so
-        # existing assertions on socket_dma.reuwrites keep working.
         self.socket_dma.reuwrite(reu_offset, data)
 
     def invalidate_cache(self):
@@ -259,8 +245,7 @@ class FakeAPI:
         self.sid_played_play_rate = play_rate
         self.sid_played_play_bank = play_bank
         self.sid_deferred = defer_audio
-        # Mirror the real backends: when not deferred, audio starts now; when
-        # deferred, the start time is recorded at begin_sid_audio().
+        # Mirrors the real backends: deferred audio starts at begin_sid_audio().
         if not defer_audio:
             self._sid_audio_start = time.time()
 
@@ -281,14 +266,10 @@ class FakeAPI:
         self.config_store.setdefault(category, {})[item] = value
 
     def get_config_category(self, category, *, timeout=3.0):
-        # Tests seed `config_store[category] = {item: value}` to model detected
-        # sockets / current addressing; default is an empty category.
         return dict(self.config_store.get(category, {}))
 
     def get_device_info(self, *, timeout=3.0):
-        # Tests seed `device_info` (dict) to model GET /v1/info; leaving it
-        # None mirrors a backend/firmware with no /v1/info (raises, like the
-        # real BackendCapabilityError default).
+        # `device_info` None mirrors firmware with no GET /v1/info (raises).
         if self.device_info is None:
             raise RuntimeError("no device info (fake)")
         return dict(self.device_info)
@@ -303,8 +284,7 @@ class FakeAPI:
         self.regs["RESTORE_PLAY_RATE"] = ()
 
     def sid_vsync_play_rate_hz(self):
-        # The kernal jiffy rate — ~60 Hz on both standards (see
-        # c64.kernal_cia1_latch); a fake never retunes it.
+        # Kernal jiffy rate, ~60 Hz on both standards; a fake never retunes it.
         return actual_rate_for_latch(kernal_cia1_latch(self.profile.system), self.profile.system)
 
     def close(self):
@@ -351,8 +331,8 @@ def make_psid(
     if second_sid_addr:
         header[4:6] = (3).to_bytes(2, "big")  # secondSIDAddress is v3+
         header[0x7A] = (second_sid_addr >> 4) & 0xFF
-    # v2+ flags at $76-$77 (big-endian): sidModel1 is bits 4-5 and sidModel2
-    # bits 6-7, both in the low byte $77. 1 = 6581, 2 = 8580.
+    # v2+ flags $76-$77 (big-endian): sidModel1 = bits 4-5, sidModel2 = bits
+    # 6-7 of low byte $77; 1 = 6581, 2 = 8580.
     bits = {"6581": 1, "8580": 2}
     # clock is bits 2-3 of the same low byte: 1 = PAL, 2 = NTSC, 3 = both.
     clock_bits = {"PAL": 1, "NTSC": 2, "PAL+NTSC": 3}
@@ -433,6 +413,149 @@ def run_irq_handler(handler: bytes, *, addr: int = 0xC100, seed: dict[int, int] 
         if mpu.pc in kernal_tails:
             return SimpleNamespace(memory=memory, exit_pc=mpu.pc, mpu=mpu)
     raise AssertionError(f"handler never chained to the kernal (PC=${mpu.pc:04X})")
+
+
+class FakeVdc:
+    """A minimal VDC behind the ``$D600``/``$D601`` porthole. Construct with
+    ``ram_kib`` (16 or 64) and ``version`` (0/1/2); pass ``.write`` / ``.read``
+    to ``VdcPorthole``, or hand the whole object to :class:`VdcMachine`."""
+
+    def __init__(self, ram_kib: int = 64, version: int = 2) -> None:
+        self.regs = [0] * 38
+        self.ram = bytearray(65536)
+        self._mask = 0x3FFF if ram_kib == 16 else 0xFFFF
+        self._version = version
+        self._selected = 0
+
+    # -- address aliasing on 16 KiB parts --
+    def _addr(self) -> int:
+        return ((self.regs[vdc.R.UPDATE_HI] << 8) | self.regs[vdc.R.UPDATE_LO]) & self._mask
+
+    def _bump_addr(self) -> None:
+        a = ((self.regs[vdc.R.UPDATE_HI] << 8) | self.regs[vdc.R.UPDATE_LO]) + 1
+        self.regs[vdc.R.UPDATE_HI], self.regs[vdc.R.UPDATE_LO] = (
+            (a >> 8) & 0xFF,
+            a & 0xFF,
+        )
+
+    def _run_block(self, count: int) -> None:
+        copy = bool(self.regs[vdc.R.V_SCROLL_CTRL] & vdc.V_SCROLL_COPY_BIT)
+        for _ in range(count):
+            dst = self._addr()
+            if copy:
+                src = (
+                    (self.regs[vdc.R.BLOCK_COPY_SRC_HI] << 8) | self.regs[vdc.R.BLOCK_COPY_SRC_LO]
+                ) & self._mask
+                self.ram[dst] = self.ram[src]
+                s = src + 1
+                self.regs[vdc.R.BLOCK_COPY_SRC_HI], self.regs[vdc.R.BLOCK_COPY_SRC_LO] = (
+                    (s >> 8) & 0xFF,
+                    s & 0xFF,
+                )
+            else:
+                self.ram[dst] = self.regs[vdc.R.DATA]
+            self._bump_addr()
+
+    # -- the porthole --
+    def write(self, addr: int, data: bytes) -> None:
+        for b in data:
+            if addr == vdc.D600_ADDR_STATUS:
+                self._selected = b & 0x3F
+            elif addr == vdc.D601_DATA:
+                self.regs[self._selected] = b
+                if self._selected == vdc.R.DATA:
+                    self.ram[self._addr()] = b
+                    self._bump_addr()
+                elif self._selected == vdc.R.WORD_COUNT:
+                    self._run_block(b)
+
+    def read(self, addr: int, n: int) -> bytes:
+        out = bytearray()
+        for _ in range(n):
+            if addr == vdc.D600_ADDR_STATUS:
+                out.append(vdc.STATUS_READY | (self._version & 0x07))
+            elif addr == vdc.D601_DATA and self._selected == vdc.R.DATA:
+                out.append(self.ram[self._addr()])
+                self._bump_addr()
+            else:
+                out.append(self.regs[self._selected])
+        return bytes(out)
+
+
+class _PortholeRam:
+    """Flat 64 KiB for py65, with ``$D600``/``$D601`` diverted to a FakeVdc.
+
+    Banking is deliberately not modeled: the C128 MMU write that the resident
+    loop makes lands in RAM here, and the cartridge stays visible at ``$8000``
+    after it. That costs nothing, because the loop jumps to RAM and never looks
+    back — and modeling the MMU would only test the model."""
+
+    def __init__(self, fake: FakeVdc) -> None:
+        self.ram = bytearray(65536)
+        self.fake = fake
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.ram[index]
+        if index in (vdc.D600_ADDR_STATUS, vdc.D601_DATA):
+            return self.fake.read(index, 1)[0]
+        return self.ram[index]
+
+    def __setitem__(self, index, value) -> None:
+        if isinstance(index, slice):
+            self.ram[index] = value
+        elif index in (vdc.D600_ADDR_STATUS, vdc.D601_DATA):
+            self.fake.write(index, bytes([value & 0xFF]))
+        else:
+            self.ram[index] = value & 0xFF
+
+    def __len__(self) -> int:
+        return len(self.ram)
+
+
+class VdcMachine:
+    """A bare 6502 running a C128-mode cartridge image against a FakeVdc.
+
+    Enough of a C128 to execute ``hw/vdc_rom.py``'s ROM end to end — the parts
+    it needs are RAM, a CPU, and the porthole. The step budgets turn a
+    mis-assembled branch, which would hang a real machine, into a failed
+    assertion."""
+
+    def __init__(self, rom: bytes, load: int = 0x8000) -> None:
+        from py65.devices.mpu6502 import MPU
+
+        self.vdc = FakeVdc()
+        self.memory = _PortholeRam(self.vdc)
+        self.memory.ram[load : load + len(rom)] = rom
+        self.mpu = MPU(memory=self.memory)
+        self.mpu.pc = load
+        self.mpu.sp = 0xFF
+
+    def run_to(self, target_pc: int, budget: int = 400_000) -> None:
+        """Step until PC reaches ``target_pc``."""
+        for _ in range(budget):
+            if self.mpu.pc == target_pc:
+                return
+            self.mpu.step()
+        raise AssertionError(
+            f"never reached ${target_pc:04X} in {budget} steps (PC=${self.mpu.pc:04X})"
+        )
+
+    def run_until_byte(self, addr: int, value: int, budget: int = 400_000) -> None:
+        """Step until RAM at ``addr`` holds ``value`` — how the host waits for
+        the resident loop to acknowledge a command."""
+        for _ in range(budget):
+            if self.memory.ram[addr] == value:
+                return
+            self.mpu.step()
+        raise AssertionError(
+            f"${addr:04X} never became ${value:02X} in {budget} steps "
+            f"(is ${self.memory.ram[addr]:02X}, PC=${self.mpu.pc:04X})"
+        )
+
+    def steps(self, n: int) -> None:
+        for _ in range(n):
+            self.mpu.step()
 
 
 def unspendable_budget(seconds: float = 6.0):
@@ -574,8 +697,6 @@ class FakeTime:
         }
 
     def __getattr__(self, name: str):
-        # Only reached for names not on the instance, so the attributes set in
-        # __init__ never route back through here.
         pinned = self.__dict__.get("_pinned", {})
         if name in pinned:
             return pinned[name]
