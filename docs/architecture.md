@@ -8,7 +8,7 @@ For end-user configuration see [the Programmer’s Reference Guide](reference/RE
 
 ## Topic areas
 
-* **[Hardware I/O & transports](architecture/hardware-io.md)** — `hw/backend.py`, `hw/api.py`, `hw/teensyrom_api.py`, `hw/teensyrom_dma.py`, `hw/vic_stream.py`, Startup: BASIC clear-and-loop program, `hw/char_rom.py`
+* **[Hardware I/O & transports](architecture/hardware-io.md)** — `hw/backend.py`, `hw/api.py`, `hw/teensyrom_api.py`, `hw/teensyrom_dma.py`, `hw/vic_stream.py`, Startup: BASIC clear-and-loop program, `hw/char_rom.py`, `hw/uci.py`
 * **[Audio output](architecture/audio.md)** — `audio/audio.py`, `audio/audio_handlers.py`, `audio/sampler.py`, `audio/dsp.py`, `audio/audio_features.py`
 * **[Video input & the color pipeline](architecture/video-color.md)** — `video/video.py`, `video/modes/`, `video/modes_irq.py`, `video/flicker.py`, `video/rolling_palette.py`, `video/palette.py`, Framerate pacing & frame-dropping, `video/framebuffer.py`, `video/preview.py`
 * **[Scenes, sources & overlays](architecture/scenes.md)** — `scenes/scenes.py`, Composable scenes, `scenes/overlays/`, `scenes/interstitial.py`, `scenes/backgrounds.py`
@@ -133,6 +133,7 @@ the two lists account for every module in the tree.
 | Startup: BASIC clear-and-loop program | [Hardware I/O & transports](architecture/hardware-io.md#startup-basic-clear-and-loop-program) |
 | `hw/teensyrom_api.py` | [Hardware I/O & transports](architecture/hardware-io.md#teensyrom_apipy--the-teensyrom-backend) |
 | `hw/teensyrom_dma.py` | [Hardware I/O & transports](architecture/hardware-io.md#teensyrom_dmapy--teensyrom-link-errors--the-launcher-upload-race) |
+| `hw/uci.py` | [Hardware I/O & transports](architecture/hardware-io.md#ucipy--the-ultimate-command-interface-at-df1c-df1f) |
 | `scenes/text_surface.py` | [Scenes, sources & overlays](architecture/scenes.md#overlays) |
 | `control/transport.py` | [Control surfaces & live performance](architecture/control.md#transportpy--live-tune-tracker--save-back-phase-1--dj-transport-engine-phase-2--record-workflow--loop-presets-phase-3--controller-profiles-phase-5) |
 | `app/update_state.py` | [Config, CLI & ensemble](architecture/config.md#update_statepy) |
@@ -156,3 +157,6 @@ lines with nothing to say.
 | Module | What it is |
 | --- | --- |
 | `__main__.py` | `python -m c64cast` entry point |
+| `hw/vdc.py` | C128 VDC (8563/8568) support primitives. Pre-implementation research tooling — not yet wired into a backend or the display-mode hierarchy; the module docstring carries the rationale and points at the plan. |
+| `hw/vdc_rom.py` | The C128-mode cartridge ROM: a resident 8502 loop that blits host RAM into VDC video RAM, so the host does a bulk DMA instead of a porthole round trip per byte. Same research status as `hw/vdc.py`; the module docstring carries the banking and mailbox design. |
+| `hw/asm6502.py` | Two-pass 6502 assembler with labels, over py65's per-line assembler. Exists so `hw/vdc_rom.py` can be readable source rather than a hand-counted byte template; the module docstring carries the one sizing rule that matters. |
