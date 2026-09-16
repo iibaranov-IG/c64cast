@@ -52,7 +52,7 @@ from c64cast.app import config as cfgmod
 from c64cast.app import config_store, console_library, media_store, paths, serve, session
 from c64cast.app.serve import SessionState
 from c64cast.app.update_state import STALE_AFTER_DAYS, UpdateCheck, write_update_state
-from c64cast.control import screen, web_api
+from c64cast.control import web_api
 from c64cast.control.transport import LiveTuneTracker
 
 TOKEN = "full-token-value"
@@ -1298,16 +1298,6 @@ class ScreenRouteTest(WebApiTestCase):
     """The C64's screen. All three routes are GETs so the read-only role can
     watch; the stream's own lifetime is tested in tests/test_screen.py."""
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        # The feed the routes share is a closure local of register_web_routes, so
-        # nothing here can close it; it ends its sweeper thread on the first sweep
-        # after the machine goes away. Class-scoped, not per-test: a per-test patch
-        # is restored while the sweeper may not have read it yet, leaving a sweeper
-        # asleep for the unpatched second — past the stray-thread grace.
-        super().setUpClass()
-        cls.enterClassContext(mock.patch.object(screen, "_SWEEP_EVERY_S", 0.01))
-
     def _api(self) -> Any:
         sess = self.manager.session
         assert sess is not None
@@ -1358,6 +1348,17 @@ class ScreenRouteTest(WebApiTestCase):
             r = c.get("/api/screen.png", headers=VIEWER_AUTH)
         self.assertEqual(r.status_code, 200)
 
+    def test_the_stream_stops_when_the_host_stops_serving(self):
+        # A still leaves the receiver lingering for the reload that may follow,
+        # and nothing sweeps a host that is going down — so the machine would
+        # go on sending until its own watchdog expired.
+        with self.client() as c:
+            self._running(c)
+            c.get("/api/screen.png", headers=AUTH)
+            receiver = self._api().receiver
+            self.assertEqual((receiver.started, receiver.stopped), (1, 0))
+        self.assertEqual(receiver.stopped, 1)
+
     def test_the_off_switch_is_answered_rather_than_unrouted(self):
         # A console asking a host with the picture turned off should hear that,
         # not a 404 it would read as an older host.
@@ -1395,14 +1396,10 @@ class ScreenRouteTest(WebApiTestCase):
         pool = self._stream_pool()
 
         parts: list[bytes] = []
-        closed: list[bool] = []
 
         def source():
-            try:
-                for i in range(1000):
-                    yield f"part{i}".encode()
-            finally:
-                closed.append(True)
+            for i in range(1000):
+                yield f"part{i}".encode()
 
         class _Gone:
             def __init__(self) -> None:
@@ -1418,22 +1415,18 @@ class ScreenRouteTest(WebApiTestCase):
                 parts.append(part)
 
         asyncio.run(drive())
-        # Three checks passed, three parts; the fourth check ended it — and the
-        # generator was closed, which is what releases the machine's stream.
+        # Three checks passed and yielded three parts; the fourth detected the
+        # disconnect. The response's ScreenFeed.release task owns the stream.
         self.assertEqual(parts, [b"part0", b"part1", b"part2"])
-        self.assertEqual(closed, [True])
 
-    def test_the_adapter_closes_the_generator_even_when_it_runs_out(self):
+    def test_the_streaming_adapter_stops_when_the_source_runs_out(self):
         import asyncio
 
         pool = self._stream_pool()
-        closed: list[bool] = []
 
         def source():
-            try:
-                yield b"only"
-            finally:
-                closed.append(True)
+            yield b"first"
+            yield b"last"
 
         class _Here:
             async def is_disconnected(self) -> bool:
@@ -1442,8 +1435,39 @@ class ScreenRouteTest(WebApiTestCase):
         async def drive() -> list[bytes]:
             return [part async for part in web_api._until_gone(source(), _Here(), pool)]
 
-        self.assertEqual(asyncio.run(drive()), [b"only"])
-        self.assertEqual(closed, [True])
+        self.assertEqual(asyncio.run(drive()), [b"first", b"last"])
+
+    def test_the_streaming_adapter_leaves_the_generator_open(self):
+        """`_until_gone` closing the generator is the bug it was corrected for:
+        a real disconnect cancels it while the worker thread is inside `next()`,
+        and closing a running generator raises `ValueError: generator already
+        executing`. The test holds its own reference so the collector cannot
+        answer the question instead."""
+        import asyncio
+        import inspect
+
+        pool = self._stream_pool()
+
+        def source():
+            while True:
+                yield b"part"
+
+        frames = source()
+
+        class _Gone:
+            def __init__(self) -> None:
+                self.asked = 0
+
+            async def is_disconnected(self) -> bool:
+                self.asked += 1
+                return self.asked > 1
+
+        async def drive() -> None:
+            async for _ in web_api._until_gone(frames, _Gone(), pool):
+                pass
+
+        asyncio.run(drive())
+        self.assertEqual(inspect.getgeneratorstate(frames), "GEN_SUSPENDED")
 
 
 class StreamSlotsTest(unittest.TestCase):
