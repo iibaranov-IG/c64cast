@@ -275,7 +275,7 @@ class MultipartTest(unittest.TestCase):
         parts = self._parts([_frame(1), _frame(1), _frame(1), _frame(2)], 2)
         self.assertEqual(len(parts), 2)
 
-    def test_closing_the_generator_is_what_ends_it(self):
+    def test_the_generator_stops_when_it_is_closed(self):
         gen = screen_mod.multipart_frames(lambda: _frame(1), fps=1000.0)
         next(gen)
         gen.close()
