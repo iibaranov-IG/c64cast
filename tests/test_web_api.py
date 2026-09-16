@@ -1396,14 +1396,10 @@ class ScreenRouteTest(WebApiTestCase):
         pool = self._stream_pool()
 
         parts: list[bytes] = []
-        closed: list[bool] = []
 
         def source():
-            try:
-                for i in range(1000):
-                    yield f"part{i}".encode()
-            finally:
-                closed.append(True)
+            for i in range(1000):
+                yield f"part{i}".encode()
 
         class _Gone:
             def __init__(self) -> None:
@@ -1419,22 +1415,18 @@ class ScreenRouteTest(WebApiTestCase):
                 parts.append(part)
 
         asyncio.run(drive())
-        # Three checks passed, three parts; the fourth check ended it — and the
-        # generator was closed, which is what releases the machine's stream.
+        # Three checks passed and yielded three parts; the fourth detected the
+        # disconnect. The response's ScreenFeed.release task owns the stream.
         self.assertEqual(parts, [b"part0", b"part1", b"part2"])
-        self.assertEqual(closed, [True])
 
-    def test_the_adapter_closes_the_generator_even_when_it_runs_out(self):
+    def test_the_streaming_adapter_stops_when_the_source_runs_out(self):
         import asyncio
 
         pool = self._stream_pool()
-        closed: list[bool] = []
 
         def source():
-            try:
-                yield b"only"
-            finally:
-                closed.append(True)
+            yield b"first"
+            yield b"last"
 
         class _Here:
             async def is_disconnected(self) -> bool:
@@ -1443,8 +1435,39 @@ class ScreenRouteTest(WebApiTestCase):
         async def drive() -> list[bytes]:
             return [part async for part in web_api._until_gone(source(), _Here(), pool)]
 
-        self.assertEqual(asyncio.run(drive()), [b"only"])
-        self.assertEqual(closed, [True])
+        self.assertEqual(asyncio.run(drive()), [b"first", b"last"])
+
+    def test_the_streaming_adapter_leaves_the_generator_open(self):
+        """`_until_gone` closing the generator is the bug it was corrected for:
+        a real disconnect cancels it while the worker thread is inside `next()`,
+        and closing a running generator raises `ValueError: generator already
+        executing`. The test holds its own reference so the collector cannot
+        answer the question instead."""
+        import asyncio
+        import inspect
+
+        pool = self._stream_pool()
+
+        def source():
+            while True:
+                yield b"part"
+
+        frames = source()
+
+        class _Gone:
+            def __init__(self) -> None:
+                self.asked = 0
+
+            async def is_disconnected(self) -> bool:
+                self.asked += 1
+                return self.asked > 1
+
+        async def drive() -> None:
+            async for _ in web_api._until_gone(frames, _Gone(), pool):
+                pass
+
+        asyncio.run(drive())
+        self.assertEqual(inspect.getgeneratorstate(frames), "GEN_SUSPENDED")
 
 
 class StreamSlotsTest(unittest.TestCase):
