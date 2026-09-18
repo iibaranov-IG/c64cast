@@ -100,6 +100,8 @@ class LifetimeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.api = _FakeApi()
         self.feed = ScreenFeed(lambda: {"c64cast": self.api})
+        # A feed that served a watcher is left holding a live sweeper thread.
+        self.addCleanup(self.feed.close)
 
     def test_the_stream_comes_up_for_a_watcher_and_stays_up_for_a_second(self):
         with self.feed.watching("c64cast"):
@@ -136,6 +138,33 @@ class LifetimeTest(unittest.TestCase):
             self.feed.close()
         self.assertEqual(self.api.stops, 1)
 
+    def test_close_is_terminal(self):
+        # The host closes the feed on the way down while its listener is still
+        # up, so a request landing in that window must not start the machine
+        # streaming again at a link that is about to close.
+        self.feed.close()
+        with self.assertRaises(screen_mod.ScreenUnavailable) as cm:
+            self.feed.acquire("c64cast")
+        self.assertIn("shutting down", str(cm.exception))
+        self.assertEqual(self.api.starts, 0)
+
+    def test_a_close_landing_mid_open_does_not_leave_the_stream_up(self):
+        # The receiver is opened outside the lock, so `close()` can sweep a map
+        # this one is not in yet — and it would come back live, with a sweeper
+        # thread, on a host that just told everything else to stop.
+        real_open = self.feed._open
+
+        def open_then_close(system):
+            receiver = real_open(system)
+            self.feed.close()
+            return receiver
+
+        with mock.patch.object(self.feed, "_open", open_then_close):
+            with self.assertRaises(screen_mod.ScreenUnavailable):
+                self.feed.acquire("c64cast")
+        self.assertEqual((self.api.starts, self.api.stops), (1, 1))
+        self.assertIsNone(self.feed._sweeper)
+
     def test_the_stream_ends_on_its_own_with_nothing_else_ticking(self):
         """The leak this feature shipped with for an afternoon, found on
         hardware: the sweep was driven by the state feed's push loop, and
@@ -164,11 +193,11 @@ class LifetimeTest(unittest.TestCase):
         self.assertIsNone(self.feed._sweeper)
 
     def test_a_receiver_does_not_outlive_the_show_it_belongs_to(self):
-        # A watcher still holding the stream open would otherwise keep a
-        # receiver alive against a backend that is gone, re-arming a watchdog
-        # over a link that no longer exists.
+        # A watcher still holding the stream open would keep a receiver alive
+        # against a backend that is gone, re-arming a watchdog over a dead link.
         running: dict[str, _FakeApi] = {"c64cast": self.api}
         feed = ScreenFeed(lambda: dict(running))
+        self.addCleanup(feed.close)
         with feed.watching("c64cast"):
             self.assertEqual(self.api.starts, 1)
             running.clear()
@@ -186,9 +215,9 @@ class LifetimeTest(unittest.TestCase):
 
 class StopQuietlyTest(unittest.TestCase):
     def test_a_failure_to_stop_is_logged_and_not_raised(self):
-        # Called from a sweep and from teardown, where there is nothing left to
-        # tell: raising would take the sweeper thread down with it and leak
-        # every other receiver.
+        # Called from a sweep and from teardown, where there is nothing left
+        # to tell: raising would take the sweeper thread down and leak every
+        # other receiver.
         class _Stuck:
             def stop(self) -> None:
                 raise OSError("the link went away")
@@ -232,8 +261,7 @@ class EncodeTest(unittest.TestCase):
         self.assertEqual(list(decoded[0, 0]), [int(c) for c in C64_PALETTE_BGR[2]])
 
     def test_png_rather_than_jpeg_is_the_smaller_one_on_this_content(self):
-        # The reason for the choice, asserted rather than left in a comment:
-        # flat 16-color art with hard edges is PNG's best case and a DCT's
+        # Flat 16-color art with hard edges is PNG's best case and a DCT's
         # worst, so the usual "JPEG for video" advice inverts here.
         import cv2
 
@@ -274,7 +302,7 @@ class MultipartTest(unittest.TestCase):
         parts = self._parts([_frame(1), _frame(1), _frame(1), _frame(2)], 2)
         self.assertEqual(len(parts), 2)
 
-    def test_closing_the_generator_is_what_ends_it(self):
+    def test_the_generator_stops_when_it_is_closed(self):
         gen = screen_mod.multipart_frames(lambda: _frame(1), fps=1000.0)
         next(gen)
         gen.close()

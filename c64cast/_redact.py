@@ -25,18 +25,15 @@ import re
 #: any real token — a fixed-width mask invites the reader to guess.
 REDACTED = "REDACTED"
 
-# Keyed on a `*token=`/`*password=`/`*secret=`/`*api[_-]key=` suffix rather
-# than on each parameter's full name, so `viewer_token=`, `token:` (JSON) and
-# any later `…_token=` are covered by construction rather than by naming each
-# one here — plus an `Authorization: Bearer …` header value, the other shape
-# the console's admin token can appear in. The value stops at whitespace, a
-# query-string separator, or a quote/brace, which leaves the rest of a login
-# URL (`&next=/`) or a JSON document's other fields readable — the point is
-# to keep the line diagnostic, not to blank the whole thing.
 _SECRET_VALUE = re.compile(
     r"""
-    (?P<kv_prefix> \b\w*(?:token|password|secret|api[_-]?key)\b "? \s* [=:] \s* "? )
-    (?P<kv_value>[^\s&"',}]+)
+    (?P<kv_prefix>
+        \b\w*(?:token|password|secret|api[_-]?key)\b ["']? \s* [=:] \s*
+        (?P<quote> ["]{3} | [']{3} | ["'] )?
+    )
+    (?P<kv_value>
+        (?(quote) (?: \\[^\r\n] | (?!(?P=quote)) [^\r\n] )+ | [^\s&"',}]+ )
+    )
     |
     (?P<bearer_prefix>\bBearer\s+) (?P<bearer_value>[^\s"',}]+)
     """,
@@ -51,6 +48,14 @@ def _mask(m: re.Match[str]) -> str:
 
 def redact_secrets(text: str) -> str:
     """`text` with every recognized secret value reduced to ``REDACTED`` —
-    `token=VALUE`, `password: VALUE`, `api_key=VALUE` (`=` or `:`, quoted or
-    not) and `Bearer VALUE`."""
+    `token=VALUE`, `password: VALUE`, `secret=VALUE`, `api_key=VALUE` (`=` or
+    `:`, with any prefix, so `viewer_token` and `client_secret` match) and
+    `Bearer VALUE`.
+
+    An unquoted value ends at whitespace, `&`, a comma, a quote, or a closing
+    brace. A quoted one — `'`, `"`, `'''` or `\"\"\"` — runs to the matching
+    quote that no backslash escapes, or to the end of the line, whichever comes
+    first: a value written across several lines is masked only as far as its
+    first newline, and one whose opening delimiter ends the line has nothing on
+    that line to mask."""
     return _SECRET_VALUE.sub(_mask, text)

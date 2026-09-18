@@ -21,6 +21,26 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
 
 ### Added
 
+- **`host_palette = "auto"` now asks an Ultimate which 16 colors it is actually
+  driving**, instead of assuming the built-in table. Every color decision in
+  the pipeline is a distance measured against that table, so a machine running
+  a custom `.vpl` palette was being quantized against the wrong 16 — a wrong
+  table does not tint the picture, it changes which color each pixel becomes.
+  The read goes over the Ultimate Command Interface, costs one round of
+  register polling at startup, and uploads no 6502 code. It needs firmware
+  **3.15** or newer, which added runtime palette control to the Command
+  Interface. Anything that cannot answer — older firmware, a failed read —
+  falls back to the built-in table exactly as before, including the existing
+  warning that names the loaded `.vpl`.
+
+- **A search box on the documentation site.** Every page at
+  <https://kfox.github.io/c64cast/> now carries a search field in the header
+  that matches against every book chapter and standalone doc, ranking a title
+  hit over a body hit, and jumps straight to the page on Enter or a click.
+  It is client-side against a JSON index `scripts/build_site.py` writes at
+  build time — no server, no third-party search service, no page reload.
+  Press `/` anywhere on the site to focus it.
+
 - **A warning when a tune's INIT does not finish running on the host
   emulator.** The scope and the reactive visuals are both drawn from a
   host-side 6502 running the same tune the SID chip plays, and a tune whose
@@ -28,7 +48,7 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
   that emulator holding only part of the register state the tune sets up. The
   tune still plays — the audio comes from the real chip — but the picture can
   disagree with it, and until now nothing said so unless you were running with
-  `-vv`. The line says which of the three things stopped the INIT, and notes
+  `-v`. The line says which of the three things stopped the INIT, and notes
   that the detected PLAY rate may be affected too, since it is measured the
   same way. A tune picked from a pool is only reported on once it is the one
   being played, and a subtune is reported on once however many times you cue
@@ -50,6 +70,17 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
   rides every state frame for them to read.
 
 ### Changed
+
+- **`-vv` now does something.** It has always been accepted and has always
+  meant exactly what `-v` means: DEBUG is reached at the first `-v`, and no
+  code anywhere read a verbosity of 2. It now releases urllib3, whose record
+  per HTTP request `-v` holds back at WARNING because it buries everything
+  else in the log. `configure_logging` holds back no other logger, so that
+  release is the whole of the difference. Reach for `-vv` when the question
+  is about an Ultimate's REST link itself: a request that never returned, a
+  status the application logged only the consequence of. A TeensyROM link
+  is serial or raw TCP, so on one of those the second `v` says nothing about
+  the link itself.
 
 - **The split scope's forced-fast-path warning is said once, not once per
   tune.** Configuring `persistence` or `scroll_columns` and then playing a
@@ -94,6 +125,46 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
   visibly less.
 
 ### Fixed
+
+- **A SID file could paint a system-mismatch arrow that was not there.** The
+  oscilloscope's metadata row marks a clock mismatch with a `\x01` sentinel,
+  swapped for a mirrored right-arrow glyph wherever it appears in the row, and
+  the PSID/RSID copyright field reached that row as raw bytes. The three header
+  text fields are now decoded as ISO-8859-1 with control characters replaced by
+  spaces.
+
+- **Shutting the web console down left the C64 streaming its screen.** Once a
+  browser had watched the picture, the Ultimate went on sending its VIC output
+  — ~2.6 MB/s of UDP — at the host that had just exited, until the firmware's
+  own 20-second watchdog stopped it. `ScreenFeed.close()` existed for exactly
+  this and nothing called it; the host now runs it on the way down, before it
+  releases the machines, so the stream ends with the process.
+
+- **A video scene with sampler audio spent a second in teardown.** Closing the
+  video source bounded-joins the demux thread that feeds the sink, and on the
+  sampler that thread parks in `push_samples` until the sampler stops — which
+  is what the audio stop does, and it ran behind the close. The close burned
+  its full 1 s bound and logged a join timeout; the audio now stops in front
+  of it.
+
+- **A scene could open on the tail of the previous scene's audio.**
+  `AudioStreamer.stop()` drained its queue without bumping the splice epoch, so
+  a producer that had captured its epoch before that drain — a file decoder
+  still mid-encode, or one just released from the backpressure spin — landed a
+  blob behind it. The next scene inherited it, and since the bring-up resets the
+  pushed count but not the queued one, `position_seconds()` read 0 until it
+  drained. `stop()` now bumps the epoch as soon as it clears `running`, the way
+  `flush()` bumps ahead of its own drain, and `push_samples` is a no-op once
+  stopped.
+
+- **An audio-file scene's teardown paused for its whole join timeout, then
+  dropped the decoder it had failed to join.** A decode thread parked in
+  `push_samples` on a full sampler queue is released by the audio stop, which
+  ran *behind* the join — so the join spent its full 2 s and returned with the
+  thread still running, and the reference was cleared anyway. Teardown now stops
+  the sink ahead of the join, and a decoder that still survives it stays
+  referenced: the next `setup()` on that source refuses to clear its stop signal
+  or start a second decoder until the survivor exits.
 
 - **A CIA-timed SID tune could peg a core for the whole scene, and the guard
   against it was skipped on exactly those tunes.** The oscilloscope and the
@@ -717,8 +788,24 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
   target has refused a `user:pass@` netloc for exactly this reason since it was
   introduced; a secret inside a scene `file` *value* was covered by none of that
   machinery, because it is not a field of its own. Every message that quotes a
-  media spec now strips URL userinfo and masks `token=`/`key=`/`password=`-style
-  query parameters, and so does the snapshot.
+  media spec now strips URL userinfo and masks `token=`/`password=`-style query
+  parameters, and so does the snapshot.
+- **A quoted secret was redacted down to its first word, or not at all.**
+  `redact_secrets` accepted only a double quote around the value and ended the
+  value at the first space, so `dma_password = "correct horse battery staple"`
+  came back as `"REDACTED horse battery staple"`, a TOML literal string
+  (`dma_password = 'hunter2'`) or a Python mapping `repr()`
+  (`{'token': 's3cr3t'}`) was not touched at all, and neither was a
+  triple-quoted `'''…'''` — which `_format_toml_error` then underlined with a
+  caret, because it believed it had redacted nothing. All three reached every
+  destination that redacts: `--log-file`, the console's log buffer served to
+  read-only viewers, and the config parse error rendered in a browser, which
+  quotes the offending line. A quoted value now runs to its matching quote — a
+  backslash-escaped one does not close it — and to the end of the line when the
+  string is unterminated, which is the usual reason the parse failed on that
+  line in the first place. Neither bound crosses a newline, so a value written
+  across several lines is masked only as far as its first newline, and a `'''`
+  or `"""` that ends the line leaves nothing on it to mask.
 - **A media URL was fetched at build time with no timeout.** The yt-dlp
   resolution runs inside `build_scene`, i.e. after the link is open and the
   machine has been reset, and it passed no `socket_timeout` (nothing in the tree
@@ -1492,7 +1579,7 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
   release `"5"`, which compares newer than everything this project has
   published, and `{"info": {"version": null}}` into `"None"`, which cleared
   the recorded `unanswered_since` and discarded the previous real answer.
-  The failure is now caught broadly and logged at debug, so `-vv`
+  The failure is now caught broadly and logged at debug, so `-v`
   distinguishes a DNS failure from a proxy's 403 from a shape change instead
   of collapsing all of them into the same silent `None`.
 - `--check-for-updates --write-state` tracebacked, and threw away the
@@ -1690,7 +1777,7 @@ in practice not read at all. Releases that ask nothing of anyone leave it out.
   cfgs=cfgs)`, so a future `LoadResult` field can't be forgotten the same way.
 - A config-resolution failure (`_resolve_configs`, covering `load_master`,
   `merge_cli`, `quickcast.build_config` and `connect.parse_connection_uri`)
-  logged only `str(e)` with no traceback, even under `-v`/`-vv` — a genuine
+  logged only `str(e)` with no traceback, even under `-v` — a genuine
   internal defect anywhere in that tree was indistinguishable from a user
   typo and left oncall to bisect by hand. A `log.debug(..., exc_info=True)`
   now runs right before the existing `log.error`, so `-v` recovers the
